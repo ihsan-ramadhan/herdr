@@ -30,11 +30,13 @@ This is the strongest persistence path because the original processes never stop
 
 If the Herdr server stops and starts again, the original pane processes are gone. Herdr restores the saved session shape: workspaces, tabs, panes, cwd, layout, and focus.
 
-Snapshot restore does not preserve running shells, servers, tests, or arbitrary processes. Panes that cannot use a stronger restore path come back as new shells in their saved directories.
+Snapshot restore does not keep the original processes alive. When Herdr saves the session, it records the foreground command and working directory of panes that are running an application. After a restart, those panes run the same argv in the saved directory instead of starting a blank shell, so a manually opened `lazygit`, `yazi`, or another terminal application comes back. The application starts fresh; its own cursor, selection, or in-app session state is not serialized. If the application already exited before the save, the pane returns as a shell. When a restored application exits, Herdr returns that pane to a shell in the same directory. Foreground command capture is available on Linux and macOS; on Windows, panes without an agent session restore as shells.
 
 If a saved directory is unavailable or the shell cannot start, the pane stays in the layout with an error instead of disappearing or moving to your home directory. Its saved directory and agent session reference remain intact. Fix the directory or shell configuration and restart the server to retry, or explicitly close the pane to remove it.
 
-When saving, Herdr prefers the live shell's directory where the operating system exposes it, and retains the last confirmed directory after the shell exits. Shell-reported directories remain the fallback on other platforms.
+When saving a pane with a captured foreground application, Herdr uses that application's working directory. For a plain shell, it prefers the live shell's directory where the operating system exposes it, and retains the last confirmed directory after the shell exits. Shell-reported directories remain the fallback on other platforms.
+
+Saved command lines are stored in `session.json` and can contain sensitive arguments, paths, or tokens. Treat the session directory like shell history.
 
 If `session.json` cannot be read or parsed, or requires a newer Herdr version, Herdr logs why loading failed. Before saving or clearing the replacement session, it preserves the original bytes in `session-backups/` beside `session.json` and logs the recovery path as `persist.backup`. A file missing at startup is checked again before the first save or clear. These failed-load recovery copies are separate from normal snapshot history.
 
@@ -110,7 +112,7 @@ Native session restore requires these Herdr integration versions or newer:
 
 Run `herdr integration status` to check installed integration versions. Reinstall outdated integrations with `herdr integration install <agent>`.
 
-Unsupported, missing, invalid, duplicated, or stale session references restore as normal shells in the saved pane directory.
+Agent panes with unsupported, missing, invalid, duplicated, or stale session references restore as normal shells in the saved pane directory.
 
 If native agent session restore applies to a pane, Herdr resumes the agent session instead of replaying saved pane history for that pane.
 

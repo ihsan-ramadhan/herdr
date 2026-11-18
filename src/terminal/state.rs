@@ -157,6 +157,9 @@ pub struct TerminalState {
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    /// Relaunch `launch_argv` when the session is restored from disk. Set for
+    /// command panes and captured foreground applications.
+    pub restore_launch_argv: bool,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
@@ -197,6 +200,7 @@ impl TerminalState {
             last_agent_completion_seq: None,
             revision: 0,
             launch_argv: None,
+            restore_launch_argv: false,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
@@ -2339,6 +2343,7 @@ impl TerminalState {
         self.last_agent_state_change_seq = None;
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
+        self.restore_launch_argv = false;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;

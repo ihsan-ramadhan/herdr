@@ -111,6 +111,15 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Relaunch `launch_argv` instead of restoring a shell in the saved cwd.
+    /// Set for command panes and panes whose foreground application can be
+    /// captured when the session is saved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_launch_argv: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,8 +341,8 @@ fn capture_tab(
     for id in tab.panes.keys() {
         let terminal_id = tab.terminal_id(*id);
         let terminal = terminal_id.and_then(|id| terminals.get(id));
-        let cwd = terminal_id
-            .and_then(|id| terminal_runtimes.get(id))
+        let runtime = terminal_id.and_then(|id| terminal_runtimes.get(id));
+        let mut cwd = runtime
             .and_then(|runtime| runtime.cwd_for_persistence())
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
@@ -349,7 +358,24 @@ fn capture_tab(
                 )
             })
             .unwrap_or_default();
-        let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let mut launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let mut restore_launch_argv = terminal.is_some_and(|terminal| terminal.restore_launch_argv);
+        // Agent panes use their native session reference. Replaying the agent
+        // argv here would silently start a new conversation when the reference
+        // is missing or stale.
+        let agent_restore = terminal.is_some_and(|terminal| {
+            terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some()
+        });
+        if !agent_restore {
+            if let Some(command) = runtime.and_then(foreground_command_for_restore) {
+                cwd = command.cwd;
+                launch_argv = Some(command.argv);
+                restore_launch_argv = true;
+            } else if launch_argv.is_some() {
+                // Command panes are relaunched with the same argv after a restart.
+                restore_launch_argv = true;
+            }
+        }
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -388,6 +414,7 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                restore_launch_argv,
             },
         );
     }
@@ -399,6 +426,51 @@ fn capture_tab(
         focused: Some(tab.layout.focused().raw()),
         root_pane: Some(tab.root_pane.raw()),
     }
+}
+
+struct CapturedForegroundCommand {
+    argv: Vec<String>,
+    cwd: PathBuf,
+}
+
+fn foreground_command_for_restore(
+    runtime: &crate::terminal::TerminalRuntime,
+) -> Option<CapturedForegroundCommand> {
+    let shell_pid = runtime.child_pid()?;
+    let job = crate::detect::foreground_job(shell_pid)?;
+    let process = foreground_command_process(&job, shell_pid)?;
+    let argv = process.argv.clone().filter(|argv| !argv.is_empty())?;
+    let cwd = crate::platform::process_cwd(process.pid)
+        .filter(|cwd| cwd.is_absolute())
+        .or_else(|| runtime.foreground_cwd())
+        .or_else(|| runtime.cwd_for_persistence())?;
+    Some(CapturedForegroundCommand { argv, cwd })
+}
+
+fn foreground_command_process(
+    job: &crate::platform::ForegroundJob,
+    shell_pid: u32,
+) -> Option<&crate::platform::ForegroundProcess> {
+    // Agent panes restore through their native session reference. Relaunching
+    // an agent command would start a new conversation instead of resuming.
+    if crate::detect::identify_agent_in_job(job).is_some() {
+        return None;
+    }
+    let leader = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id);
+    if let Some(process) = leader.filter(|process| !is_shell_process(process)) {
+        return Some(process);
+    }
+    job.processes
+        .iter()
+        .find(|process| process.pid != shell_pid && !is_shell_process(process))
+}
+
+fn is_shell_process(process: &crate::platform::ForegroundProcess) -> bool {
+    let name = process.argv0.as_deref().unwrap_or(&process.name);
+    crate::platform::is_pane_shell_process_name(name)
 }
 
 pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
@@ -594,6 +666,83 @@ mod tests {
         }
     }
 
+    fn foreground_process(
+        pid: u32,
+        name: &str,
+        argv: &[&str],
+    ) -> crate::platform::ForegroundProcess {
+        crate::platform::ForegroundProcess {
+            pid,
+            name: name.into(),
+            argv0: None,
+            argv: Some(argv.iter().map(|arg| (*arg).to_string()).collect()),
+            cmdline: Some(argv.join(" ")),
+        }
+    }
+
+    #[test]
+    fn foreground_command_skips_the_idle_shell() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 10,
+            processes: vec![foreground_process(10, "bash", &["bash"])],
+        };
+        assert!(foreground_command_process(&job, 10).is_none());
+    }
+
+    #[test]
+    fn foreground_command_uses_the_group_leader_application() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 20,
+            processes: vec![
+                foreground_process(10, "bash", &["bash"]),
+                foreground_process(20, "lazygit", &["lazygit"]),
+            ],
+        };
+        assert_eq!(
+            foreground_command_process(&job, 10).map(|process| process.pid),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn foreground_command_uses_an_exec_replaced_shell() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 10,
+            processes: vec![foreground_process(10, "yazi", &["yazi"])],
+        };
+        assert_eq!(
+            foreground_command_process(&job, 10).map(|process| process.pid),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn foreground_command_skips_agent_processes() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 20,
+            processes: vec![
+                foreground_process(10, "bash", &["bash"]),
+                foreground_process(20, "codex", &["codex"]),
+            ],
+        };
+        assert!(foreground_command_process(&job, 10).is_none());
+    }
+
+    #[test]
+    fn foreground_command_skips_a_shell_wrapper() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 10,
+            processes: vec![
+                foreground_process(10, "bash", &["bash", "-c", "lazygit"]),
+                foreground_process(11, "lazygit", &["lazygit"]),
+            ],
+        };
+        assert_eq!(
+            foreground_command_process(&job, 10).map(|process| process.pid),
+            Some(11)
+        );
+    }
+
     #[test]
     fn managed_agent_snapshot_omits_pending_and_persists_active_ownership() {
         let mut state = state_with_workspaces(&["managed-snapshot"]);
@@ -707,6 +856,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                restore_launch_argv: false,
             },
         );
         panes.insert(
@@ -719,6 +869,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                restore_launch_argv: false,
             },
         );
 
@@ -1405,6 +1556,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                restore_launch_argv: false,
             },
         );
         panes.insert(
@@ -1419,6 +1571,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                restore_launch_argv: false,
             },
         );
 

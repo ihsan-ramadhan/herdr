@@ -62,7 +62,8 @@ type RestoredTab = (
 );
 type RestoreFailures<T> = (T, usize);
 
-/// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
+/// Restore workspaces from a snapshot. Pane commands marked for restore are
+/// relaunched in their saved cwd; every other pane gets a fresh shell.
 pub fn restore(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
@@ -451,6 +452,7 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        terminal.restore_launch_argv = pane.restore_launch_argv;
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -538,6 +540,9 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        let saved_restore_launch_argv = saved_pane
+            .filter(|pane| pane.restore_launch_argv)
+            .and_then(|pane| pane.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -631,56 +636,61 @@ fn restore_tab(
             continue;
         }
 
-        let runtime_result = {
-            #[cfg(unix)]
-            if let Some(imported) = imported_runtime {
-                TerminalRuntime::from_handoff_fd(
-                    crate::handoff_runtime::ImportedHandoffRuntime {
-                        master_fd: imported.master_fd,
-                        state: imported.state.with_pane_id(*id),
-                    },
-                    runtime_context.scrollback_limit_bytes,
-                    crate::terminal_theme::TerminalTheme::default(),
-                    None,
-                    runtime_context.events.clone(),
-                    runtime_context.render_notify.clone(),
-                    runtime_context.render_dirty.clone(),
-                )
-            } else {
-                TerminalRuntime::spawn_with_initial_history(
-                    *id,
-                    rows,
-                    cols,
-                    cwd.clone(),
-                    runtime_context.scrollback_limit_bytes,
-                    crate::terminal_theme::TerminalTheme::default(),
-                    None,
-                    runtime_context.shell_config,
-                    &launch_env,
-                    startup.initial_history_ansi,
-                    runtime_context.events.clone(),
-                    runtime_context.render_notify.clone(),
-                    runtime_context.render_dirty.clone(),
-                )
-            }
+        #[cfg(unix)]
+        let imported_handoff = imported_runtime.map(|imported| {
+            TerminalRuntime::from_handoff_fd(
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: imported.master_fd,
+                    state: imported.state.with_pane_id(*id),
+                },
+                runtime_context.scrollback_limit_bytes,
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                runtime_context.events.clone(),
+                runtime_context.render_notify.clone(),
+                runtime_context.render_dirty.clone(),
+            )
+        });
+        // Imported panes are rejected before this point on non-Unix targets.
+        #[cfg(not(unix))]
+        let imported_handoff = None::<std::io::Result<TerminalRuntime>>;
 
-            #[cfg(not(unix))]
-            {
-                TerminalRuntime::spawn_with_initial_history(
-                    *id,
-                    rows,
-                    cols,
-                    cwd.clone(),
-                    runtime_context.scrollback_limit_bytes,
-                    crate::terminal_theme::TerminalTheme::default(),
-                    None,
-                    runtime_context.shell_config,
-                    &launch_env,
-                    startup.initial_history_ansi,
-                    runtime_context.events.clone(),
-                    runtime_context.render_notify.clone(),
-                    runtime_context.render_dirty.clone(),
-                )
+        let runtime_result = match imported_handoff {
+            Some(result) => result,
+            None => {
+                if let Some(argv) = saved_restore_launch_argv.as_deref() {
+                    TerminalRuntime::spawn_argv_command(
+                        *id,
+                        rows,
+                        cols,
+                        cwd.clone(),
+                        argv,
+                        &launch_env,
+                        crate::pane::AgentDetection::Enabled,
+                        runtime_context.scrollback_limit_bytes,
+                        crate::terminal_theme::TerminalTheme::default(),
+                        None,
+                        runtime_context.events.clone(),
+                        runtime_context.render_notify.clone(),
+                        runtime_context.render_dirty.clone(),
+                    )
+                } else {
+                    TerminalRuntime::spawn_with_initial_history(
+                        *id,
+                        rows,
+                        cols,
+                        cwd.clone(),
+                        runtime_context.scrollback_limit_bytes,
+                        crate::terminal_theme::TerminalTheme::default(),
+                        None,
+                        runtime_context.shell_config,
+                        &launch_env,
+                        startup.initial_history_ansi,
+                        runtime_context.events.clone(),
+                        runtime_context.render_notify.clone(),
+                        runtime_context.render_dirty.clone(),
+                    )
+                }
             }
         };
 
@@ -688,11 +698,18 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
-                if was_imported {
-                    if let Some(argv) = saved_launch_argv {
-                        terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
-                    }
+                let restored_argv = if was_imported {
+                    saved_launch_argv
+                } else {
+                    saved_restore_launch_argv
+                };
+                if let Some(argv) = restored_argv {
+                    // Restored applications return to a shell when they exit,
+                    // so closing a git UI or editor does not close the pane.
+                    terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                 }
+                terminal.restore_launch_argv = terminal.launch_argv.is_some()
+                    && saved_pane.is_some_and(|pane| pane.restore_launch_argv);
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
@@ -752,7 +769,7 @@ fn restore_tab(
                 if !was_imported {
                     let terminal = unavailable_restored_terminal(
                         saved_pane, cwd,
-                        format!("Could not start the saved shell: {e}. Fix the shell configuration and restart this session."),
+                        format!("Could not start the saved pane command: {e}. Fix the command and restart this session."),
                     );
                     panes.insert(*id, PaneState::new(terminal.id.clone()));
                     terminals.push(terminal);
@@ -1554,6 +1571,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            restore_launch_argv: false,
                         },
                     )]),
                     zoomed: false,
@@ -1636,6 +1654,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                restore_launch_argv: false,
                             },
                         ),
                         (
@@ -1648,6 +1667,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                restore_launch_argv: false,
                             },
                         ),
                     ]),
@@ -1702,6 +1722,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    restore_launch_argv: false,
                 },
             )
         };
@@ -1718,6 +1739,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            restore_launch_argv: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1870,6 +1892,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            restore_launch_argv: false,
                         },
                     )]),
                     zoomed: false,
@@ -1940,6 +1963,118 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_relaunches_only_panes_marked_for_command_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(10)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([
+                        (
+                            10,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: cwd.clone(),
+                                label: Some("running".into()),
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: None,
+                                agent_resume: None,
+                                launch_argv: Some(vec!["sh".into(), "-c".into(), "sleep 5".into()]),
+                                restore_launch_argv: true,
+                            },
+                        ),
+                        (
+                            20,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: cwd.clone(),
+                                label: Some("idle".into()),
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: None,
+                                agent_resume: None,
+                                launch_argv: Some(vec!["sh".into(), "-c".into(), "sleep 5".into()]),
+                                restore_launch_argv: false,
+                            },
+                        ),
+                    ]),
+                    zoomed: false,
+                    focused: Some(10),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        assert_eq!(runtimes.len(), 2);
+
+        let tab = &workspaces[0].tabs[0];
+        let terminal_for = |label: &str| {
+            let pane_id = tab
+                .layout
+                .pane_ids()
+                .into_iter()
+                .find(|pane_id| {
+                    tab.terminal_id(*pane_id)
+                        .and_then(|terminal_id| terminals.get(terminal_id))
+                        .and_then(|terminal| terminal.manual_label.as_deref())
+                        == Some(label)
+                })
+                .expect("labeled pane");
+            let terminal_id = tab.terminal_id(pane_id).expect("terminal id");
+            terminals.get(terminal_id).expect("terminal")
+        };
+        let running = terminal_for("running");
+        assert_eq!(
+            running.launch_argv.as_deref(),
+            Some(&["sh".to_string(), "-c".into(), "sleep 5".into()][..])
+        );
+        assert!(running.restore_launch_argv);
+        assert!(running.respawn_shell_on_exit);
+        assert!(runtimes.contains_key(&running.id));
+
+        let idle = terminal_for("idle");
+        assert!(idle.launch_argv.is_none());
+        assert!(!idle.restore_launch_argv);
+        assert!(!idle.respawn_shell_on_exit);
+        assert!(runtimes.contains_key(&idle.id));
     }
 
     #[tokio::test]
@@ -2176,6 +2311,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                restore_launch_argv: false,
             },
         );
         let mut history = SessionHistorySnapshot {
